@@ -1,14 +1,26 @@
-# Render Blueprint для Backend
-# Используйте для автоматического деплоя
-
+# Конфигурация для Render.com
 services:
   - type: web
-    name: telegram-miniapp-backend
+    name: roulette-backend
     env: node
+    region: frankfurt
+    plan: free
+    rootDir: backend
     buildCommand: npm install
     startCommand: npm start
+    healthCheckPath: /api/health
     envVars:
       - key: BOT_TOKEN
-        sync: false # Установите вручную в Render Dashboard
+        sync: false
       - key: FRONTEND_URL
-        sync: false # URL вашего фронтенда
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: INITIAL_BALANCE
+        value: "100"
+      - key: DATABASE_PATH
+        value: "/var/data/roulette.db"
+    disk:
+      name: roulette-data
+      mountPath: /var/data
+      sizeGB: 1
