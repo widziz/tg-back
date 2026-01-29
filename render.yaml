@@ -1,0 +1,14 @@
+# Render Blueprint для Backend
+# Используйте для автоматического деплоя
+
+services:
+  - type: web
+    name: telegram-miniapp-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BOT_TOKEN
+        sync: false # Установите вручную в Render Dashboard
+      - key: FRONTEND_URL
+        sync: false # URL вашего фронтенда
