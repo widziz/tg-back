@@ -202,7 +202,7 @@ app.use((req, res, next) => {
 function validateInitData(initData) {
   if (!initData) return { valid: false };
   
-  // Демо режим без токена
+  // Демо режим без токена - принимаем любые данные
   if (!BOT_TOKEN) {
     try {
       const params = new URLSearchParams(initData);
@@ -211,9 +211,15 @@ function validateInitData(initData) {
         return { valid: true, user: JSON.parse(userStr), demo: true };
       }
     } catch (e) {
-      // ignore
+      // Если не удалось распарсить - создаём демо юзера
+      console.log('Demo mode: creating mock user');
     }
-    return { valid: false };
+    // В демо режиме без BOT_TOKEN всегда пропускаем
+    return { 
+      valid: true, 
+      user: { id: 123456789, username: 'demo_user', first_name: 'Demo' }, 
+      demo: true 
+    };
   }
 
   try {
@@ -252,9 +258,19 @@ function validateInitData(initData) {
 
 function authMiddleware(req, res, next) {
   const initData = req.headers['x-telegram-init-data'];
+  
+  console.log('🔐 Auth middleware:', {
+    hasInitData: !!initData,
+    initDataLength: initData?.length || 0,
+    hasBotToken: !!BOT_TOKEN,
+  });
+  
   const { valid, user, demo, error } = validateInitData(initData);
   
+  console.log('🔐 Validation result:', { valid, userId: user?.id, demo, error });
+  
   if (!valid) {
+    console.log('❌ Auth failed:', error);
     return res.status(401).json({ error: error || 'Unauthorized' });
   }
   
@@ -504,402 +520,10 @@ app.get('/api/history', authMiddleware, (req, res) => {
   }
 });
 
-// Создать инвойс для пополнения
-app.post('/api/deposit', authMiddleware, async (req, res) => {
-  try {
-    const { amount } = req.body;
-    const user = getOrCreateUser(req.telegramUser);
-
-    if (!BOT_TOKEN) {
-      return res.status(400).json({ error: 'Payments not configured. Add BOT_TOKEN.' });
-    }
-
-    const option = DEPOSIT_OPTIONS.find(o => o.amount === amount);
-    if (!option) {
-      return res.status(400).json({ error: 'Invalid deposit amount' });
-    }
-
-    const bonus = Math.floor(amount * option.bonus / 100);
-    const total = amount + bonus;
-
-    // Создаём payload для отслеживания платежа
-    const payload = JSON.stringify({
-      type: 'deposit',
-      txId: Date.now(),
-      oderId: Math.random().toString(36).substring(7),
-      userId: user.id,
-      amount: total
-    });
-
-    // Записываем транзакцию
-    dbRun(
-      'INSERT INTO transactions (user_id, type, amount, stars_amount, bonus_amount, payload, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [user.id, 'deposit', total, amount, bonus, payload, 'pending']
-    );
-    saveDatabase();
-
-    console.log(`💳 Creating invoice: user ${user.id}, ${amount}⭐ + ${bonus} bonus`);
-
-    // Создаём инвойс через Telegram API
-    const invoiceLink = await telegramAPI('createInvoiceLink', {
-      title: `Пополнение ${amount}⭐`,
-      description: bonus > 0 ? `Пополнение баланса +${option.bonus}% бонус (${bonus}⭐)` : 'Пополнение баланса',
-      payload,
-      currency: 'XTR',
-      prices: [{ label: `${amount} Stars`, amount: amount }]
-    });
-
-    res.json({
-      success: true,
-      invoiceLink,
-      amount,
-      bonus,
-      total
-    });
-  } catch (e) {
-    console.error('Deposit error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Варианты пополнения
-app.get('/api/deposit-options', (req, res) => {
-  res.json({
-    success: true,
-    options: DEPOSIT_OPTIONS,
-    currency: 'XTR'
+// Start server
+initDatabase().then(() => {
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
   });
 });
-
-// ============================================
-// ADMIN ROUTES
-// ============================================
-
-// Статистика
-app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
-  try {
-    const totalUsers = dbGet('SELECT COUNT(*) as count FROM users');
-    const totalSpins = dbGet('SELECT COUNT(*) as count FROM spins');
-    const totalWagered = dbGet('SELECT SUM(total_wagered) as sum FROM users');
-    const totalWon = dbGet('SELECT SUM(total_won) as sum FROM users');
-    const totalDeposited = dbGet('SELECT SUM(total_deposited) as sum FROM users');
-    
-    res.json({
-      success: true,
-      stats: {
-        totalUsers: totalUsers?.count || 0,
-        totalSpins: totalSpins?.count || 0,
-        totalWagered: totalWagered?.sum || 0,
-        totalWon: totalWon?.sum || 0,
-        totalDeposited: totalDeposited?.sum || 0,
-        profit: (totalWagered?.sum || 0) - (totalWon?.sum || 0)
-      }
-    });
-  } catch (e) {
-    console.error('Stats error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Все пользователи
-app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const users = dbAll('SELECT * FROM users ORDER BY last_active DESC LIMIT ?', [limit]);
-    res.json({ success: true, users });
-  } catch (e) {
-    console.error('Users error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Установить баланс
-app.post('/api/admin/set-balance', authMiddleware, adminMiddleware, (req, res) => {
-  try {
-    const { userId, balance } = req.body;
-    dbRun('UPDATE users SET balance = ? WHERE id = ?', [balance, userId]);
-    saveDatabase();
-    console.log(`⚙️ Admin set balance: user ${userId} → ${balance}⭐`);
-    res.json({ success: true });
-  } catch (e) {
-    console.error('Set balance error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Забанить пользователя
-app.post('/api/admin/ban', authMiddleware, adminMiddleware, (req, res) => {
-  try {
-    const { userId } = req.body;
-    dbRun('UPDATE users SET is_banned = 1 WHERE id = ?', [userId]);
-    saveDatabase();
-    console.log(`🚫 Admin banned user: ${userId}`);
-    res.json({ success: true });
-  } catch (e) {
-    console.error('Ban error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Разбанить пользователя
-app.post('/api/admin/unban', authMiddleware, adminMiddleware, (req, res) => {
-  try {
-    const { userId } = req.body;
-    dbRun('UPDATE users SET is_banned = 0 WHERE id = ?', [userId]);
-    saveDatabase();
-    console.log(`✅ Admin unbanned user: ${userId}`);
-    res.json({ success: true });
-  } catch (e) {
-    console.error('Unban error:', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// ============================================
-// WEBHOOK
-// ============================================
-app.post('/api/webhook', async (req, res) => {
-  try {
-    const update = req.body;
-
-    // Pre-checkout query - подтверждаем платёж
-    if (update.pre_checkout_query) {
-      const query = update.pre_checkout_query;
-      console.log(`💳 Pre-checkout: ${query.from.id} - ${query.total_amount} ${query.currency}`);
-      
-      await telegramAPI('answerPreCheckoutQuery', {
-        pre_checkout_query_id: query.id,
-        ok: true
-      });
-    }
-
-    // Успешный платёж
-    if (update.message?.successful_payment) {
-      const payment = update.message.successful_payment;
-      const userId = update.message.from.id;
-
-      console.log(`✅ Payment success: ${userId} - ${payment.total_amount} ${payment.currency}`);
-
-      try {
-        const payload = JSON.parse(payment.invoice_payload);
-        
-        if (payload.type === 'deposit') {
-          // Находим транзакцию
-          const tx = dbGet(
-            "SELECT * FROM transactions WHERE payload = ? AND status = 'pending' LIMIT 1",
-            [payment.invoice_payload]
-          );
-          
-          if (tx) {
-            // Обновляем транзакцию
-            dbRun(
-              'UPDATE transactions SET status = ?, telegram_payment_id = ? WHERE id = ?',
-              ['completed', payment.telegram_payment_charge_id, tx.id]
-            );
-            
-            // Добавляем баланс
-            dbRun(
-              'UPDATE users SET balance = balance + ?, total_deposited = total_deposited + ? WHERE id = ?',
-              [payload.amount, payload.amount, payload.userId]
-            );
-            
-            saveDatabase();
-            
-            const user = dbGet('SELECT * FROM users WHERE id = ?', [payload.userId]);
-            console.log(`💰 Deposit complete: user ${payload.userId} +${payload.amount}⭐ = ${user?.balance}⭐`);
-
-            // Отправляем уведомление
-            await telegramAPI('sendMessage', {
-              chat_id: userId,
-              text: `✅ *Баланс пополнен!*\n\n💫 Сумма: +${payload.amount}⭐\n💳 Текущий баланс: ${user?.balance}⭐\n\n🎰 Удачи в игре!`,
-              parse_mode: 'Markdown'
-            });
-          } else {
-            console.warn('Transaction not found for payload:', payment.invoice_payload);
-          }
-        }
-      } catch (e) {
-        console.error('Payment processing error:', e);
-      }
-    }
-
-    // Команды бота
-    if (update.message?.text?.startsWith('/')) {
-      const chatId = update.message.chat.id;
-      const text = update.message.text;
-      const userId = update.message.from.id;
-      const webAppUrl = FRONTEND_URL !== '*' ? FRONTEND_URL.split(',')[0] : null;
-
-      if (text === '/start') {
-        await telegramAPI('sendMessage', {
-          chat_id: chatId,
-          text: `🎰 *Добро пожаловать в Roulette!*\n\n` +
-                `Крути рулетку и выигрывай Stars ⭐\n\n` +
-                `🎁 Стартовый бонус: ${INITIAL_BALANCE}⭐\n` +
-                `💎 Множители до 20x\n` +
-                `⚡ Система бустов\n\n` +
-                `Нажми кнопку ниже, чтобы начать!`,
-          parse_mode: 'Markdown',
-          reply_markup: webAppUrl ? {
-            inline_keyboard: [[
-              { text: '🎮 Играть', web_app: { url: webAppUrl } }
-            ]]
-          } : undefined
-        });
-      }
-
-      if (text === '/balance') {
-        const user = dbGet('SELECT * FROM users WHERE id = ?', [userId]);
-        if (user) {
-          await telegramAPI('sendMessage', {
-            chat_id: chatId,
-            text: `💰 *Ваш баланс*\n\n` +
-                  `⭐ Баланс: ${user.balance}\n` +
-                  `🎰 Всего спинов: ${user.total_spins}\n` +
-                  `🏆 Выиграно: ${user.total_won}⭐\n` +
-                  `⚡ Буст: ${user.has_boost ? 'Активен ×2' : 'Нет'}`,
-            parse_mode: 'Markdown',
-            reply_markup: webAppUrl ? {
-              inline_keyboard: [[
-                { text: '🎮 Играть', web_app: { url: webAppUrl } }
-              ]]
-            } : undefined
-          });
-        } else {
-          await telegramAPI('sendMessage', {
-            chat_id: chatId,
-            text: '❌ Вы ещё не играли. Используйте /start для начала!',
-          });
-        }
-      }
-
-      if (text === '/help') {
-        await telegramAPI('sendMessage', {
-          chat_id: chatId,
-          text: `ℹ️ *Как играть*\n\n` +
-                `1. Выбери ставку: 25, 50, 100 или 250⭐\n` +
-                `2. Нажми "Крутить"\n` +
-                `3. Получи выигрыш!\n\n` +
-                `*Призы:*\n` +
-                `🧸 0.6x - частый\n` +
-                `🌹🎁 1x - обычный\n` +
-                `💐🚀 2x - редкий\n` +
-                `💎💍🏆 4x - очень редкий\n` +
-                `🐍 20x - легендарный\n` +
-                `⚡ Буст - ×2 к следующему выигрышу\n\n` +
-                `*Команды:*\n` +
-                `/start - Начать игру\n` +
-                `/balance - Проверить баланс\n` +
-                `/help - Эта справка`,
-          parse_mode: 'Markdown'
-        });
-      }
-    }
-
-    res.sendStatus(200);
-  } catch (e) {
-    console.error('Webhook error:', e);
-    res.sendStatus(200); // Всегда отвечаем 200 чтобы Telegram не ретраил
-  }
-});
-
-// Установить вебхук
-app.get('/api/set-webhook', async (req, res) => {
-  try {
-    const { url } = req.query;
-    if (!url) {
-      return res.status(400).json({ error: 'URL required. Example: /api/set-webhook?url=https://your-backend.com' });
-    }
-    
-    const result = await telegramAPI('setWebhook', {
-      url: `${url}/api/webhook`,
-      allowed_updates: ['message', 'pre_checkout_query']
-    });
-    
-    console.log('✅ Webhook set:', url);
-    res.json({ success: true, result });
-  } catch (e) {
-    console.error('Set webhook error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Удалить вебхук
-app.get('/api/delete-webhook', async (req, res) => {
-  try {
-    const result = await telegramAPI('deleteWebhook', {});
-    console.log('✅ Webhook deleted');
-    res.json({ success: true, result });
-  } catch (e) {
-    console.error('Delete webhook error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Информация о вебхуке
-app.get('/api/webhook-info', async (req, res) => {
-  try {
-    const result = await telegramAPI('getWebhookInfo', {});
-    res.json({ success: true, info: result });
-  } catch (e) {
-    console.error('Webhook info error:', e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ============================================
-// 404
-// ============================================
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-// ============================================
-// START SERVER
-// ============================================
-const PORT = process.env.PORT || 3000;
-
-async function startServer() {
-  try {
-    await initDatabase();
-    
-    app.listen(PORT, () => {
-      console.log('\n' + '='.repeat(50));
-      console.log('🎰 TELEGRAM ROULETTE BACKEND');
-      console.log('='.repeat(50));
-      console.log(`📡 Server:     http://localhost:${PORT}`);
-      console.log(`🤖 Bot Token:  ${BOT_TOKEN ? '✅ Configured' : '❌ Not set (demo mode)'}`);
-      console.log(`📂 Database:   ${DB_PATH}`);
-      console.log(`👑 Admins:     ${ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None'}`);
-      console.log(`🎁 Start bal:  ${INITIAL_BALANCE}⭐`);
-      console.log('='.repeat(50));
-      console.log('\n📌 Endpoints:');
-      console.log('   POST /api/auth         - Authorize user');
-      console.log('   GET  /api/balance      - Get balance');
-      console.log('   POST /api/spin         - Spin the wheel');
-      console.log('   GET  /api/history      - Spin history');
-      console.log('   POST /api/deposit      - Create invoice');
-      console.log('   POST /api/webhook      - Telegram webhook');
-      console.log('   GET  /api/set-webhook  - Set webhook URL');
-      console.log('   GET  /api/health       - Health check\n');
-    });
-  } catch (e) {
-    console.error('Failed to start server:', e);
-    process.exit(1);
-  }
-}
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('\n👋 Shutting down...');
-  saveDatabase();
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('\n👋 Shutting down...');
-  saveDatabase();
-  process.exit(0);
-});
-
-startServer();
